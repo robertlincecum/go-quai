@@ -690,6 +690,47 @@ func (tx *Transaction) AsMessage(s Signer, baseFee *big.Int) (Message, error) {
 	return msg, err
 }
 
+// AsMessage returns the transaction as a core.Message.
+func (tx *Transaction) AsMessageWithSender(s Signer, baseFee *big.Int, sender *common.InternalAddress) (Message, error) {
+	msg := Message{
+		nonce:      tx.Nonce(),
+		gasLimit:   tx.Gas(),
+		gasPrice:   new(big.Int).Set(tx.GasPrice()),
+		gasFeeCap:  new(big.Int).Set(tx.GasFeeCap()),
+		gasTipCap:  new(big.Int).Set(tx.GasTipCap()),
+		to:         tx.To(),
+		amount:     tx.Value(),
+		data:       tx.Data(),
+		accessList: tx.AccessList(),
+		checkNonce: true,
+		txtype:     tx.Type(),
+	}
+	// If baseFee provided, set gasPrice to effectiveGasPrice.
+	if baseFee != nil {
+		msg.gasPrice = math.BigMin(msg.gasPrice.Add(msg.gasTipCap, baseFee), msg.gasFeeCap)
+	}
+	var err error
+	if tx.Type() == ExternalTxType {
+		msg.from = common.ZeroAddr
+		msg.etxsender, err = Sender(s, tx)
+		msg.checkNonce = false
+	} else {
+		if sender != nil {
+			msg.from = common.NewAddressFromData(sender)
+		} else {
+			msg.from, err = Sender(s, tx)
+		}
+	}
+	if internalToExternalTx, ok := tx.IsInternalToExternalTx(); ok {
+		msg.etxGasLimit = internalToExternalTx.ETXGasLimit
+		msg.etxGasPrice = internalToExternalTx.ETXGasPrice
+		msg.etxGasTip = internalToExternalTx.ETXGasTip
+		msg.etxData = internalToExternalTx.ETXData
+		msg.etxAccessList = internalToExternalTx.ETXAccessList
+	}
+	return msg, err
+}
+
 func (m Message) From() common.Address      { return m.from }
 func (m Message) To() *common.Address       { return m.to }
 func (m Message) GasPrice() *big.Int        { return m.gasPrice }

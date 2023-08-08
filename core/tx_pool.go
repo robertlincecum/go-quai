@@ -34,6 +34,7 @@ import (
 	"github.com/dominant-strategies/go-quai/log"
 	"github.com/dominant-strategies/go-quai/metrics"
 	"github.com/dominant-strategies/go-quai/params"
+	orderedmap "github.com/wk8/go-ordered-map/v2"
 )
 
 const (
@@ -158,6 +159,7 @@ type TxPoolConfig struct {
 
 	AccountSlots uint64 // Number of executable transaction slots guaranteed per account
 	GlobalSlots  uint64 // Maximum number of executable transaction slots for all accounts
+	MaxSenders   uint64
 	AccountQueue uint64 // Maximum number of non-executable transaction slots permitted per account
 	GlobalQueue  uint64 // Maximum number of non-executable transaction slots for all accounts
 
@@ -175,6 +177,7 @@ var DefaultTxPoolConfig = TxPoolConfig{
 
 	AccountSlots: 1,
 	GlobalSlots:  9000 + 1024, // urgent + floating queue capacity with 4:1 ratio
+	MaxSenders:   30000,       // at least 3 blocks worth of transactions in case of reorg
 	AccountQueue: 1,
 	GlobalQueue:  2048,
 
@@ -244,14 +247,16 @@ type TxPool struct {
 	locals  *accountSet // Set of local transaction to exempt from eviction rules
 	journal *txJournal  // Journal of local transaction to back up to disk
 
-	pending map[common.InternalAddress]*txList   // All currently processable transactions
-	queue   map[common.InternalAddress]*txList   // Queued but non-processable transactions
-	beats   map[common.InternalAddress]time.Time // Last heartbeat from each known account
-	all     *txLookup                            // All transactions to allow lookups
-	priced  *txPricedList                        // All transactions sorted by price
-
-	localTxsCount  int // count of txs in last 1 min. Purely for logging purpose
-	remoteTxsCount int // count of txs in last 1 min. Purely for logging purpose
+	pending        map[common.InternalAddress]*txList                          // All currently processable transactions
+	queue          map[common.InternalAddress]*txList                          // Queued but non-processable transactions
+	beats          map[common.InternalAddress]time.Time                        // Last heartbeat from each known account
+	all            *txLookup                                                   // All transactions to allow lookups
+	priced         *txPricedList                                               // All transactions sorted by price
+	senders        *orderedmap.OrderedMap[common.Hash, common.InternalAddress] // Tx hash to sender lookup
+	sendersCh      chan newSender
+	SendersMutex   sync.RWMutex // Mutex for senders map
+	localTxsCount  int          // count of txs in last 1 min. Purely for logging purpose
+	remoteTxsCount int          // count of txs in last 1 min. Purely for logging purpose
 
 	reOrgCounter int // keeps track of the number of times the runReorg is called, it is reset every c_reorgCounterThreshold times
 
@@ -269,6 +274,11 @@ type txpoolResetRequest struct {
 	oldHead, newHead *types.Header
 }
 
+type newSender struct {
+	hash   common.Hash
+	sender common.InternalAddress
+}
+
 // NewTxPool creates a new transaction pool to gather, sort and filter inbound
 // transactions from the network.
 func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain blockChain) *TxPool {
@@ -284,6 +294,8 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 		pending:         make(map[common.InternalAddress]*txList),
 		queue:           make(map[common.InternalAddress]*txList),
 		beats:           make(map[common.InternalAddress]time.Time),
+		senders:         orderedmap.New[common.Hash, common.InternalAddress](),
+		sendersCh:       make(chan newSender, 1000), // TODO: Determine proper buffer (at 500 TPS in zone, 2s buffer)
 		all:             newTxLookup(),
 		chainHeadCh:     make(chan ChainHeadEvent, chainHeadChanSize),
 		reqResetCh:      make(chan *txpoolResetRequest),
@@ -324,7 +336,7 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 	pool.chainHeadSub = pool.chain.SubscribeChainHeadEvent(pool.chainHeadCh)
 	pool.wg.Add(1)
 	go pool.loop()
-
+	go pool.sendersGoroutine()
 	return pool
 }
 
@@ -648,6 +660,10 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 		log.Warn("tx has insufficient gas", "gas supplied", tx.Gas(), "gas needed", intrGas, "tx", tx)
 		return ErrIntrinsicGas
 	}
+	if len(pool.sendersCh) == 1000 {
+		log.Error("sendersCh is full, blocking until there is room")
+	}
+	pool.sendersCh <- newSender{tx.Hash(), internal}
 	return nil
 }
 
@@ -1628,6 +1644,47 @@ func (pool *TxPool) demoteUnexecutables() {
 	}
 	if pool.reOrgCounter == c_reorgCounterThreshold {
 		log.Info("Time taken to demoteExecutables", "time", common.PrettyDuration(time.Since(start)))
+	}
+}
+
+// GetSenderThreadUnsafe returns the sender of a stored transaction.
+func (pool *TxPool) GetSender(hash common.Hash) (common.InternalAddress, bool) {
+	pool.SendersMutex.RLock()
+	defer pool.SendersMutex.RUnlock()
+	return pool.senders.Get(hash)
+}
+
+// GetSenderThreadUnsafe returns the sender of a stored transaction.
+// It is not thread safe and should only be used when the pool senders mutex is locked.
+func (pool *TxPool) GetSenderThreadUnsafe(hash common.Hash) (common.InternalAddress, bool) {
+	return pool.senders.Get(hash)
+}
+
+func (pool *TxPool) SetSender(hash common.Hash, address common.InternalAddress) {
+	pool.SendersMutex.Lock()
+	defer pool.SendersMutex.Unlock()
+	pool.senders.Set(hash, address)
+}
+
+// sendersGoroutine asynchronously adds a new sender to the cache
+func (pool *TxPool) sendersGoroutine() {
+	for {
+		select {
+		case <-pool.reorgShutdownCh:
+			return
+		case tx := <-pool.sendersCh:
+			// Add transaction to sender cache
+			pool.SendersMutex.Lock() // We could RLock here but it's unlikely to just be a read
+			if _, ok := pool.senders.Get(tx.hash); !ok {
+				pool.senders.Set(tx.hash, tx.sender)
+				if pool.senders.Len() > int(pool.config.MaxSenders) {
+					pool.senders.Delete(pool.senders.Oldest().Key)
+				}
+			} else {
+				log.Debug("Tx already seen in sender cache (reorg?)", "tx", tx.hash.String(), "sender", tx.sender.String())
+			}
+			pool.SendersMutex.Unlock()
+		}
 	}
 }
 
