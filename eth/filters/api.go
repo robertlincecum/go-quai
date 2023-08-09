@@ -594,7 +594,7 @@ func (api *PublicFilterAPI) PendingHeader(ctx context.Context) (*rpc.Subscriptio
 	rpcSub := notifier.CreateSubscription()
 
 	go func() {
-		header := make(chan *types.Header)
+		header := make(chan *types.Header, 20)
 		headerSub := api.events.SubscribePendingHeader(header)
 
 		for {
